@@ -1,11 +1,33 @@
 // api/teacher-approved.js
+import fetch from 'node-fetch'; // Décommenter si nécessaire en local
 
-// Configuration codée en dur pour simplifier la lecture, 
-// mais on utilisera process.env pour les secrets.
 const TAG_TO_ADD = "teacher-approved";
 
+// Nouvelle fonction pour obtenir un token temporaire (Client Credentials Flow)
+async function getShopifyAccessToken() {
+  const url = `https://${process.env.SHOPIFY_SHOP_DOMAIN}/admin/oauth/access_token`;
+  
+  const params = new URLSearchParams();
+  params.append('client_id', process.env.SHOPIFY_CLIENT_ID);
+  params.append('client_secret', process.env.SHOPIFY_CLIENT_SECRET);
+  params.append('grant_type', 'client_credentials');
+
+  const response = await fetch(url, {
+    method: 'POST',
+    body: params
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to get access token: ${text}`);
+  }
+
+  const data = await response.json();
+  return data.access_token; // Ce token est valide temporairement
+}
+
 export default async function handler(req, res) {
-  // 1. Sécurité & Validation de méthode
+  // 1. Sécurité Webhook (Rien ne change ici)
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -18,81 +40,62 @@ export default async function handler(req, res) {
 
   const { email } = req.body;
   if (!email) {
-    console.error("⚠️ Payload invalide : Email manquant.");
     return res.status(400).json({ error: 'Missing email' });
   }
 
   try {
-    console.log(`🔍 Recherche du client : ${email}`);
+    // 2. Authentification : Obtenir le token dynamique
+    // On le fait à chaque requête pour garantir qu'il est valide (stateless)
+    // En production intensive, on pourrait le mettre en cache, mais pour un webhook c'est négligeable.
+    const accessToken = await getShopifyAccessToken();
 
-    // 2. Chercher le customer ID via Shopify API
-    // On demande juste l'ID et les tags pour être léger
+    // 3. Recherche du client
     const shopUrl = `https://${process.env.SHOPIFY_SHOP_DOMAIN}/admin/api/2024-01/customers/search.json?query=email:${encodeURIComponent(email)}&fields=id,tags`;
     
     const searchRes = await fetch(shopUrl, {
       headers: {
-        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+        'X-Shopify-Access-Token': accessToken, // On utilise le token dynamique ici
         'Content-Type': 'application/json'
       }
     });
 
-    if (!searchRes.ok) {
-      throw new Error(`Erreur Shopify Search: ${searchRes.statusText}`);
-    }
+    if (!searchRes.ok) throw new Error(`Shopify Search Error: ${searchRes.statusText}`);
 
     const searchData = await searchRes.json();
-
     if (searchData.customers.length === 0) {
-      console.warn(`🤷 Client introuvable pour ${email}`);
-      // On renvoie 200 pour que Klaviyo ne réessaie pas en boucle inutilement
-      return res.status(200).json({ message: 'Customer not found in Shopify' });
+      return res.status(200).json({ message: 'Customer not found' });
     }
 
     const customer = searchData.customers[0];
     const currentTagsString = customer.tags || "";
-
-    // 3. Logique de Tags (Idempotence & Nettoyage)
-    // On transforme la string "tag1, tag 2" en tableau propre pour manipuler
     let tagsArray = currentTagsString.split(',').map(t => t.trim()).filter(t => t.length > 0);
 
-    // Vérifier si le tag existe déjà
     if (tagsArray.includes(TAG_TO_ADD)) {
-      console.log(`✅ Client ${customer.id} a déjà le tag. Aucune action.`);
       return res.status(200).json({ message: 'Tag already exists', skipped: true });
     }
 
-    // Ajouter le nouveau tag
     tagsArray.push(TAG_TO_ADD);
     const newTagsString = tagsArray.join(', ');
 
-    console.log(`📝 Mise à jour client ${customer.id}. Tags: "${currentTagsString}" -> "${newTagsString}"`);
-
-    // 4. Mettre à jour Shopify
+    // 4. Mise à jour
     const updateUrl = `https://${process.env.SHOPIFY_SHOP_DOMAIN}/admin/api/2024-01/customers/${customer.id}.json`;
     const updateRes = await fetch(updateUrl, {
       method: 'PUT',
       headers: {
-        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+        'X-Shopify-Access-Token': accessToken, // Et ici aussi
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        customer: {
-          id: customer.id,
-          tags: newTagsString
-        }
+        customer: { id: customer.id, tags: newTagsString }
       })
     });
 
-    if (!updateRes.ok) {
-      const errDetail = await updateRes.text();
-      throw new Error(`Erreur Shopify Update: ${errDetail}`);
-    }
+    if (!updateRes.ok) throw new Error(`Shopify Update Error: ${await updateRes.text()}`);
 
-    console.log("🎉 Tags mis à jour avec succès.");
     return res.status(200).json({ success: true, tags: newTagsString });
 
   } catch (error) {
-    console.error("❌ Erreur serveur:", error);
-    return res.status(500).json({ error: 'Internal Server Error', details: error.message });
+    console.error("❌ Erreur:", error);
+    return res.status(500).json({ error: error.message });
   }
 }

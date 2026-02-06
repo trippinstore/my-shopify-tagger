@@ -1,5 +1,4 @@
 // api/teacher-approved.js
-import fetch from 'node-fetch'; // Décommenter si nécessaire en local
 
 const TAG_TO_ADD = "teacher-approved";
 
